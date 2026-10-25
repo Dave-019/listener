@@ -33,7 +33,6 @@ from main import (
 )
 from summarize import (
     chunk_for_telegram,
-    period_label,
     render_digest_pdf,
     summarize,
 )
@@ -145,13 +144,8 @@ async def build_digest(
     if use_llm and messages:
         try:
             markdown, count = await summarize(messages, hours)
-            title, start, end = period_label(hours)
             path = OUTPUT_DIR / f"digest-{stamp}-{hours:g}h.pdf"
-            subtitle = (
-                f"{start:%Y-%m-%d %H:%M} \u2192 {end:%Y-%m-%d %H:%M} \u00b7 "
-                f"{count} posts \u00b7 {channel_count} channels"
-            )
-            render_digest_pdf(markdown, path, subtitle)
+            render_digest_pdf(markdown, path)
             return path, count, markdown
         except Exception as error:  # noqa: BLE001 - fall back to the raw listing
             log.exception("llm digest failed; falling back to raw listing")

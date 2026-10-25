@@ -3,3 +3,8 @@
 __pycache__/
 *.pyc
 .venv/
+out/
+*.log
+*.pid
+state.json
+cron_state.json

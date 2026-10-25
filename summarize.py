@@ -51,7 +51,7 @@ from main import Message, sanitize
 log = logging.getLogger("lifeos.llm")
 
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "deepseek-v4.1-flash")
-BASE_URL = os.getenv("LLM_BASE_URL", "https://api.a6api.com/v1").rstrip("/")
+BASE_URL = os.getenv("LLM_BASE_URL", "").rstrip("/")
 MAX_INPUT_CHARS = int(os.getenv("LLM_MAX_INPUT_CHARS", "120000") or 120000)
 PER_MESSAGE_CHARS = int(os.getenv("LLM_PER_MESSAGE_CHARS", "1200") or 1200)
 MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "8000") or 8000)
@@ -85,18 +85,21 @@ Output format, exactly:
 # Speed run YYYY-MM-DD period N
 
 ## Section name
-- **Short title**: one or two clauses of hard facts, separated by semicolons. — https://permalink
-- **Short title**: facts. — https://permalink (post: https://second-permalink)
+- **Short title**: one or two clauses of hard facts, separated by semicolons. · https://permalink
+- **Short title**: facts. · https://permalink (post: https://second-permalink)
 
 Rules:
 - One bullet per story, never one bullet per post. If several posts cover the same \
-story, write a single bullet and cite each permalink, the main one after an em dash \
-and the rest in parentheses as `(post: URL)`.
+story, write a single bullet and cite each permalink: the main one after the middle \
+dot, the rest in parentheses as `(post: URL)`.
 - A bullet is one line. No sub-bullets, no paragraphs, no blank lines inside a bullet.
-- Title: at most 12 words, factual, no colon at the end, no editorialising.
+- Title: at most 12 words, factual, no trailing colon, no editorialising.
 - The summary after the colon must be dense and concrete. Prefer enumerating real \
 details (versions, RFC numbers, CVE ids, subnets, salaries, deadlines) over describing \
 what the post is about.
+- NEVER use the em dash character (U+2014) or the en dash character (U+2013) as \
+punctuation. Use a colon, semicolon, comma, parentheses, or the middle dot instead. \
+Hyphens in ranges such as 90,000-130,000 stay as plain ASCII hyphens.
 - Never invent. No fact may appear that is not in the posts. Do not explain what a \
 product, company or acronym is. Do not add background, history, or implications.
 - Never translate. If a post is not in English, summarise its facts in English but do \
@@ -111,8 +114,12 @@ Cyber Threat Intel, Infrastructure / Ops, Jobs, Learning, Other.
 - For a set of parallel vacancies or listings, use a section heading plus a markdown \
 table with a header row. Every cell must contain only values present in the posts. Put \
 the apply link in its own column as a bare URL.
-- If the last section needs a closing note comparing this period with the previous one, \
-skip it. Do not add commentary, summaries of the digest, or a closing paragraph.
+- Do not add any closing note, comparison with earlier periods, commentary about the \
+digest, counts, or window metadata. The digest ends with the last bullet.
+- Never write filler such as "no further details given", "details unavailable", \
+"not specified", or "see post". If a post carries nothing beyond its headline, output \
+the bullet as `- **Headline**: · https://permalink` or simply \
+`- **Headline** · https://permalink` with no body text.
 
 No preamble, no closing remarks, no code fences, no numbered lists, no headings other \
 than the ones specified."""
@@ -155,6 +162,8 @@ async def call_model(prompt: str, model: str, timeout: float = 420.0) -> str:
     api_key = os.getenv("LLM_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("LLM_API_KEY is not set")
+    if not BASE_URL:
+        raise RuntimeError("LLM_BASE_URL is not set")
     payload = {
         "model": model,
         "messages": [
@@ -166,7 +175,7 @@ async def call_model(prompt: str, model: str, timeout: float = 420.0) -> str:
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     last_error = "unknown error"
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(f"{BASE_URL}/chat/completions", json=payload, headers=headers)
@@ -182,9 +191,18 @@ async def call_model(prompt: str, model: str, timeout: float = 420.0) -> str:
             if not choices:
                 raise RuntimeError(f"LLM returned no choices: {str(body)[:200]}")
             choice = choices[0]
-            content = ((choice.get("message") or {}).get("content") or "").strip()
+            message = choice.get("message") or {}
+            content = (message.get("content") or "").strip()
             if not content:
-                raise RuntimeError("LLM returned empty content")
+                # Reasoning models can spend the whole budget on hidden tokens and
+                # return an empty message. Retry, then let the caller split the batch.
+                last_error = (
+                    f"empty content (finish_reason={choice.get('finish_reason')}, "
+                    f"usage={body.get('usage', {})})"
+                )
+                log.warning("llm empty content attempt=%s %s", attempt + 1, last_error)
+                await asyncio.sleep(1 + attempt)
+                continue
             if choice.get("finish_reason") == "length":
                 log.warning("llm output truncated at max_tokens=%s; digest may be incomplete", MAX_OUTPUT_TOKENS)
             return content
@@ -200,6 +218,26 @@ def strip_fences(text: str) -> str:
         cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
         cleaned = re.sub(r"\n?```$", "", cleaned)
     return cleaned.strip()
+
+
+# The gateway masks the provider name "OpenAI" as "[OI]" in both requests and
+# responses, so restore it before the digest is rendered.
+MASKED_VENDOR = re.compile(r"\[\s*OI\s*\]")
+
+
+def restore_masked(text: str) -> str:
+    return MASKED_VENDOR.sub("OpenAI", text)
+
+
+EM_DASH_RE = re.compile(r"\s*\u2014\s*")
+
+
+def normalize_dashes(text: str) -> str:
+    """Replace em dashes with a middle dot, per the house style.
+
+    En dashes are left alone because they appear inside numeric ranges.
+    """
+    return EM_DASH_RE.sub(" \u00b7 ", text)
 
 
 def count_entries(markdown: str) -> int:
@@ -274,8 +312,31 @@ async def summarize_batch(
     )
     if omitted:
         prompt += f"\n\nNote: {omitted} posts were dropped for length and are not shown."
-    content = strip_fences(await call_model(prompt, model))
-    sections = parse_sections(content)
+    try:
+        content = restore_masked(strip_fences(await call_model(prompt, model)))
+    except RuntimeError as error:
+        if len(batch) <= 1:
+            log.error("batch %s/%s failed on a single post: %s", batch_index, batch_total, error)
+            return []
+        middle = len(batch) // 2
+        log.warning(
+            "batch %s/%s failed (%s); splitting %s posts into %s + %s",
+            batch_index,
+            batch_total,
+            error,
+            len(batch),
+            middle,
+            len(batch) - middle,
+        )
+        left = await summarize_batch(
+            batch[:middle], hours, title, model, batch_index, batch_total
+        )
+        right = await summarize_batch(
+            batch[middle:], hours, title, model, batch_index, batch_total
+        )
+        return left + right
+
+    sections = parse_sections(normalize_dashes(content))
     if not sections:
         log.warning("batch %s/%s produced no sections", batch_index, batch_total)
     return sections
@@ -295,7 +356,7 @@ async def summarize(messages: list[Message], hours: float, model: str | None = N
         collected.extend(sections)
         log.info("llm batch %s/%s posts=%s sections=%s", index, len(batches), len(batch), len(sections))
 
-    content = merge_sections(collected, title)
+    content = normalize_dashes(merge_sections(collected, title))
     bullets = count_entries(content)
     log.info(
         "llm digest built model=%s posts=%s bullets=%s chars=%s",
@@ -346,16 +407,23 @@ def clean_url(url: str) -> str:
     return value
 
 
+def _anchor(url: str, label: str) -> str:
+    return (
+        f'<link href="{url}">'
+        f'<font color="#1d4ed8">{label}</font>'
+        f"</link>"
+    )
+
+
 def inline_markup(text: str) -> str:
     value = escape(text)
     value = INLINE_LINK_RE.sub(
-        lambda match: f'<link href="{clean_url(match.group(2))}">{match.group(1)}</link>', value
+        lambda match: _anchor(clean_url(match.group(2)), match.group(1)), value
     )
     value = BOLD_RE.sub(lambda match: f"<b>{match.group(1)}</b>", value)
     value = ITALIC_RE.sub(lambda match: f"<i>{match.group(1)}</i>", value)
     value = BARE_URL_RE.sub(
-        lambda match: f'<link href="{clean_url(match.group(1))}">{clean_url(match.group(1))}</link>',
-        value,
+        lambda match: _anchor(clean_url(match.group(1)), clean_url(match.group(1))), value
     )
     return value
 
@@ -423,10 +491,24 @@ def register_fonts() -> tuple[str, str, bool]:
     from reportlab.pdfbase.pdfmetrics import getRegisteredFontNames
 
     registered = set(getRegisteredFontNames())
-    if sans_ok and "DigestSansBold" not in registered:
-        pdfmetrics.registerFontFamily("DigestSans", normal="DigestSans", bold="DigestSans", italic="DigestSans", boldItalic="DigestSans")
-    if serif_ok and "DigestSerifBold" not in registered:
-        pdfmetrics.registerFontFamily("DigestSerif", normal="DigestSerif", bold="DigestSerif", italic="DigestSerif", boldItalic="DigestSerif")
+    if sans_ok:
+        sans_bold_face = "DigestSansBold" if "DigestSansBold" in registered else "DigestSans"
+        pdfmetrics.registerFontFamily(
+            "DigestSans",
+            normal="DigestSans",
+            bold=sans_bold_face,
+            italic="DigestSans",
+            boldItalic=sans_bold_face,
+        )
+    if serif_ok:
+        serif_bold_face = "DigestSerifBold" if "DigestSerifBold" in registered else "DigestSerif"
+        pdfmetrics.registerFontFamily(
+            "DigestSerif",
+            normal="DigestSerif",
+            bold=serif_bold_face,
+            italic="DigestSerif",
+            boldItalic=serif_bold_face,
+        )
 
     if not sans_ok:
         log.warning("no unicode sans font found; falling back to Helvetica")
@@ -441,24 +523,17 @@ def digest_styles(sans: str, serif: str) -> dict[str, ParagraphStyle]:
     sans_bold = "DigestSansBold" if sans == "DigestSans" else "Helvetica-Bold"
     serif_bold = "DigestSerifBold" if serif == "DigestSerif" else "Times-Bold"
     return {
-        "kicker": ParagraphStyle(
-            "Kicker", fontName=sans, fontSize=7.6, leading=10, textColor=ACCENT,
-            spaceAfter=3,
-        ),
         "h1": ParagraphStyle(
-            "DigestH1", fontName=sans_bold, fontSize=21, leading=25, textColor=INK,
-            spaceAfter=3,
-        ),
-        "meta": ParagraphStyle(
-            "DigestMeta", fontName=sans, fontSize=8.2, leading=12, textColor=MUTED,
+            "DigestH1", fontName=sans_bold, fontSize=19, leading=23, textColor=INK,
+            spaceAfter=10,
         ),
         "section": ParagraphStyle(
-            "DigestSection", fontName=sans_bold, fontSize=10.4, leading=13,
-            textColor=ACCENT, spaceBefore=2, spaceAfter=5,
+            "DigestSection", fontName=sans_bold, fontSize=10.6, leading=13.5,
+            textColor=ACCENT, spaceBefore=13, spaceAfter=5,
         ),
         "bullet": ParagraphStyle(
-            "DigestBullet", fontName=serif, fontSize=9.4, leading=13.2,
-            textColor=INK, leftIndent=9, firstLineIndent=-9, spaceAfter=4.6,
+            "DigestBullet", fontName=serif, fontSize=9.4, leading=13.4,
+            textColor=INK, leftIndent=10, firstLineIndent=-10, spaceAfter=5,
         ),
         "note": ParagraphStyle(
             "DigestNote", fontName=serif, fontSize=9, leading=13,
@@ -498,8 +573,10 @@ def table_from_rows(rows: list[list[str]], styles: dict[str, ParagraphStyle]) ->
 
 
 def render_digest_pdf(markdown: str, out_path: Path, subtitle: str = "") -> None:
+    markdown = normalize_dashes(markdown)
     sans, serif, unicode_ok = register_fonts()
     styles = digest_styles(sans, serif)
+    sans_bold = "DigestSansBold" if sans == "DigestSans" else "Helvetica-Bold"
 
     def text(value: str) -> str:
         cleaned = sanitize(value)
@@ -533,13 +610,6 @@ def render_digest_pdf(markdown: str, out_path: Path, subtitle: str = "") -> None
         canvas.saveState()
         canvas.setFont(sans, 7.2)
         canvas.setFillColor(MUTED)
-        if doc_.page > 1:
-            canvas.drawString(doc.leftMargin, A4[1] - 11 * mm, text(doc_title))
-            canvas.setStrokeColor(RULE)
-            canvas.setLineWidth(0.4)
-            canvas.line(doc.leftMargin, A4[1] - 13 * mm, A4[0] - doc.rightMargin, A4[1] - 13 * mm)
-        canvas.setFont(sans, 7.2)
-        canvas.drawString(doc.leftMargin, 9 * mm, f"lifeos-listener \u00b7 {datetime.now():%Y-%m-%d %H:%M}")
         canvas.drawRightString(A4[0] - doc.rightMargin, 9 * mm, f"{doc_.page}")
         canvas.restoreState()
 
@@ -572,23 +642,10 @@ def render_digest_pdf(markdown: str, out_path: Path, subtitle: str = "") -> None
         flush_table()
 
         if stripped.startswith("## "):
-            story.append(
-                HRFlowable(
-                    width="100%", thickness=1.0, color=colors.HexColor("#f0c9a0"),
-                    spaceBefore=13, spaceAfter=5,
-                )
-            )
             story.append(Paragraph(text(stripped[3:]).upper(), styles["section"]))
             continue
         if stripped.startswith("# "):
-            doc_title = stripped[2:].strip()
-            story.append(Paragraph("TELEGRAM DIGEST", styles["kicker"]))
-            story.append(Paragraph(markup(doc_title), styles["h1"]))
-            if subtitle:
-                story.append(Paragraph(markup(subtitle), styles["meta"]))
-            story.append(
-                HRFlowable(width="100%", thickness=1.4, color=ACCENT, spaceBefore=7, spaceAfter=2)
-            )
+            story.append(Paragraph(markup(stripped[2:].strip()), styles["h1"]))
             continue
         if stripped.startswith(("- ", "* ")):
             body = stripped[2:].strip()
@@ -596,8 +653,10 @@ def render_digest_pdf(markdown: str, out_path: Path, subtitle: str = "") -> None
             if match:
                 heading = match.group(1).strip()
                 rest = match.group(2).strip()
-                rendered = f"<b>{markup(heading)}</b>"
-                if rest and not rest.startswith(("\u2014", "-", "\u2013")):
+                rendered = (
+                    f'<font name="{sans_bold}" color="#0f172a">{markup(heading)}</font>'
+                )
+                if rest and not rest.startswith(("\u2014", "-", "\u2013", "(", "[", "\u00b7")):
                     rendered += f'<font color="#b45309">:</font> {markup(rest)}'
                 elif rest:
                     rendered += f" {markup(rest)}"
